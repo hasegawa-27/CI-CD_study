@@ -32,12 +32,15 @@ jobs:
 
       - name: Terraform Init
         run: terraform init
+        working-directory: modules
 
       - name: Terraform Format Check
         run: terraform fmt -check
+        working-directory: modules
 
       - name: Terraform Validate
         run: terraform validate
+        working-directory: modules
 
       - name: Terraform Test
         run: terraform test
