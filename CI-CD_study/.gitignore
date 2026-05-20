@@ -1,0 +1,8 @@
+# 秘密情報
+terraform.tfvars
+
+# 自動生成ファイル
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
