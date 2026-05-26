@@ -1,0 +1,773 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  VPC + EC2 + RDS (MySQL) + ALB + CloudWatch Alarms + WAF + WAF Logs の構成テンプレート
+  - パブリックサブネット x2（EC2, ALB用）
+  - プライベートサブネット x2（RDS用）
+  - SSH は指定IPのみ許可
+  - CloudWatch アラーム（EC2・RDS・ALB の監視）
+  - WAF（Web Application Firewall）による不正アクセス防御
+  - WAF ログを CloudWatch Logs へ転送
+
+# ============================================================
+# パラメータ（デプロイ時に入力する値）
+# ============================================================
+Parameters:
+
+  # --- ネットワーク ---
+  VpcCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: VPC の CIDR ブロック
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: "10.0.1.0/24"
+    Description: パブリックサブネット1（AZ-a）
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: "10.0.2.0/24"
+    Description: パブリックサブネット2（AZ-c）※ALB は2AZ必要
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: "10.0.11.0/24"
+    Description: プライベートサブネット1（AZ-a）RDS用
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: "10.0.12.0/24"
+    Description: プライベートサブネット2（AZ-c）RDS用
+
+  # --- EC2 ---
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: "【必須】EC2 に SSH 接続するためのキーペア名"
+
+  Ec2InstanceType:
+    Type: String
+    Default: "t3.micro"
+    AllowedValues: ["t3.micro", "t3.small", "t3.medium"]
+    Description: EC2 インスタンスタイプ
+
+  Ec2AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+    Description: EC2 の AMI（デフォルト：最新の Amazon Linux 2023）
+
+  # --- SSH アクセス制限 ---
+  SshAllowedCidr:
+    Type: String
+    Description: "【必須】SSH を許可するあなたのIPアドレス（例: 203.0.113.10/32）"
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$"
+    ConstraintDescription: "x.x.x.x/xx 形式で入力してください"
+
+  # --- RDS ---
+  DbName:
+    Type: String
+    Default: "mydb"
+    Description: データベース名
+
+  DbUser:
+    Type: String
+    Default: "admin"
+    Description: DB 管理者ユーザー名
+
+  DbPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: "【必須】DB パスワード（8文字以上）"
+
+  DbInstanceClass:
+    Type: String
+    Default: "db.t3.micro"
+    AllowedValues: ["db.t3.micro", "db.t3.small", "db.t3.medium"]
+    Description: RDS インスタンスクラス
+
+  # --- CloudWatch アラーム通知先 ---
+  AlarmEmail:
+    Type: String
+    Description: "【必須】CloudWatch アラームの通知先メールアドレス"
+    AllowedPattern: "^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$"
+    ConstraintDescription: "有効なメールアドレスを入力してください"
+
+# ============================================================
+# リソース
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # VPC & ネットワーク
+  # ----------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  # インターネットゲートウェイ（VPC からインターネットへの出入口）
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # パブリックサブネット（EC2・ALB が置かれる、インターネット接続可能なサブネット）
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-2"
+
+  # プライベートサブネット（RDS が置かれる、インターネット非接続のサブネット）
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-2"
+
+  # ルートテーブル（パブリックサブネット用：インターネット経由のルートを追加）
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ----------------------------------------------------------
+  # セキュリティグループ
+  # ----------------------------------------------------------
+
+  # ALB 用セキュリティグループ（HTTP/HTTPS をインターネット全体から受け付ける）
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP/HTTPS inbound from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+          Description: HTTP from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+          Description: HTTPS from internet
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb-sg"
+
+  # EC2 用セキュリティグループ
+  # - SSH: 指定IPのみ
+  # - HTTP: ALB からのみ
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 - SSH from specified IP, HTTP from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshAllowedCidr
+          Description: SSH from your IP only
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: HTTP from ALB only
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ec2-sg"
+
+  # RDS 用セキュリティグループ（MySQL ポート 3306 を EC2 からのみ許可）
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS - MySQL inbound from EC2 only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+          Description: MySQL from EC2 only
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-rds-sg"
+
+  # ----------------------------------------------------------
+  # EC2
+  # ----------------------------------------------------------
+  Ec2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref Ec2InstanceType
+      ImageId: !Ref Ec2AmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref Ec2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ec2"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # パッケージ更新と Web サーバーインストール（必要に応じて変更してください）
+          dnf update -y
+          dnf install -y httpd
+          systemctl enable httpd
+          systemctl start httpd
+          echo "<h1>Hello from ${AWS::StackName}</h1>" > /var/www/html/index.html
+
+  # ----------------------------------------------------------
+  # RDS (MySQL)
+  # ----------------------------------------------------------
+
+  # RDS は2つのサブネットが必要なため「サブネットグループ」を作成
+  RdsSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS MySQL
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-rds-subnet-group"
+
+  RdsInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot  # スタック削除時にスナップショットを取得
+    Properties:
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-rds"
+      DBName: !Ref DbName
+      Engine: mysql
+      EngineVersion: "8.0.45"
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: "20"
+      MasterUsername: !Ref DbUser
+      MasterUserPassword: !Ref DbPassword
+      DBSubnetGroupName: !Ref RdsSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      MultiAZ: false           # 本番環境では true 推奨
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7 # 7日間自動バックアップ
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-rds"
+
+  # ----------------------------------------------------------
+  # ALB (Application Load Balancer)
+  # ----------------------------------------------------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb"
+
+  # ターゲットグループ（ALB からトラフィックを転送する先の EC2 グループ）
+  AlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-tg"
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: "/"
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Targets:
+        - Id: !Ref Ec2Instance
+          Port: 80
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-tg"
+
+  # リスナー（ALB がポート 80 で受け取ってターゲットグループに転送）
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AlbTargetGroup
+
+  # ----------------------------------------------------------
+  # SNS トピック（CloudWatch アラームの通知先）
+  # ----------------------------------------------------------
+  # SNS = Simple Notification Service
+  # アラームが発火したとき、このトピック経由でメール通知が届く
+  AlarmSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alarm-topic"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  # ----------------------------------------------------------
+  # CloudWatch アラーム
+  # ----------------------------------------------------------
+
+  # ① EC2 CPU 使用率アラーム
+  # CPU が5分間 80% を超えたら通知
+  Ec2CpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ec2-cpu-high"
+      AlarmDescription: "EC2 の CPU 使用率が 80% を超えました"
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref Ec2Instance
+      Statistic: Average
+      Period: 300        # 5分間の平均
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmSnsTopic
+      OKActions:
+        - !Ref AlarmSnsTopic  # 回復時にも通知
+
+  # ② EC2 ステータスチェック失敗アラーム
+  # EC2 インスタンスに問題が起きたら通知
+  Ec2StatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ec2-status-check"
+      AlarmDescription: "EC2 のステータスチェックが失敗しました"
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref Ec2Instance
+      Statistic: Maximum
+      Period: 60         # 1分ごとにチェック
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmSnsTopic
+
+  # ③ RDS CPU 使用率アラーム
+  # DB の CPU が5分間 80% を超えたら通知
+  RdsCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-rds-cpu-high"
+      AlarmDescription: "RDS の CPU 使用率が 80% を超えました"
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RdsInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmSnsTopic
+      OKActions:
+        - !Ref AlarmSnsTopic
+
+  # ④ RDS 空きストレージアラーム
+  # 空き容量が 2GB を下回ったら通知（単位：バイト）
+  RdsFreeStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-rds-storage-low"
+      AlarmDescription: "RDS の空きストレージが 2GB を下回りました"
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RdsInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2147483648  # 2GB（バイト換算：2 * 1024 * 1024 * 1024）
+      ComparisonOperator: LessThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmSnsTopic
+
+  # ⑤ RDS DB 接続数アラーム
+  # 接続数が 100 を超えたら通知
+  RdsConnectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-rds-connections-high"
+      AlarmDescription: "RDS の接続数が 100 を超えました"
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RdsInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmSnsTopic
+
+  # ⑥ ALB 5xx エラーアラーム
+  # サーバーエラー（500番台）が5分間に 10 件を超えたら通知
+  AlbError5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-alb-5xx-errors"
+      AlarmDescription: "ALB で 5xx エラーが多発しています（5分間で10件超）"
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching  # データなし = 正常とみなす
+      AlarmActions:
+        - !Ref AlarmSnsTopic
+
+  # ⑦ ALB ターゲット応答時間アラーム
+  # レスポンスが平均 3秒 を超えたら通知（遅延検知）
+  AlbTargetResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-alb-response-time"
+      AlarmDescription: "ALB のターゲット応答時間が 3秒 を超えました"
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmSnsTopic
+
+  # ⑧ ALB ヘルスチェック失敗アラーム
+  # 正常なターゲット数が 1 を下回ったら通知（全 EC2 が落ちた状態）
+  AlbUnhealthyHostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-alb-unhealthy-hosts"
+      AlarmDescription: "ALB のヘルスチェックに失敗したホストがあります"
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt AlbTargetGroup.TargetGroupFullName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmSnsTopic
+
+  # ----------------------------------------------------------
+  # WAF (Web Application Firewall)
+  # ----------------------------------------------------------
+  # WAF = 不正なリクエスト（SQLインジェクション、XSSなど）を
+  # ALBの手前でブロックするセキュリティサービス
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${AWS::StackName}-web-acl"
+      Scope: REGIONAL          # ALB に紐付けるため REGIONAL を指定（CloudFront の場合は CLOUDFRONT）
+      Description: "WAF Rule Set for ALB"
+      DefaultAction:
+        Allow: {}              # デフォルトはすべて許可（ルールに引っかかったものをブロック）
+      VisibilityConfig:
+        SampledRequestsEnabled: true   # リクエストのサンプリングを有効化
+        CloudWatchMetricsEnabled: true # CloudWatch メトリクスを有効化
+        MetricName: !Sub "${AWS::StackName}-web-acl"
+      Rules:
+        # --- ルール① AWS マネージドルール（共通の脅威を自動でブロック）---
+        # AWS が管理するルールセット。SQLi・XSS・既知の悪意あるIPなどを自動検知
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}           # マネージドルールの設定をそのまま使用
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+
+        # --- ルール② 既知の悪意あるIPリスト ---
+        # AWS が管理する、悪意のある既知IPアドレスをブロック
+        - Name: AWSManagedRulesAmazonIpReputationList
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesAmazonIpReputationList
+
+        # --- ルール③ SQL インジェクション対策 ---
+        # フォームやURLにSQLコードを混入する攻撃をブロック
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesSQLiRuleSet
+
+        # --- ルール④ レートリミット（同一IPからの大量リクエストを制限）---
+        # 5分間に 2000 件を超えるリクエストを送ってくるIPをブロック（DDoS対策）
+        - Name: RateLimitRule
+          Priority: 4
+          Action:
+            Block: {}          # ブロックする
+          Statement:
+            RateBasedStatement:
+              Limit: 2000      # 5分間あたりの上限リクエスト数
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitRule
+
+  # WAF を ALB に紐付け
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref ApplicationLoadBalancer
+      WebACLArn: !GetAtt WebAcl.Arn
+
+  # ----------------------------------------------------------
+  # WAF ログ → CloudWatch Logs 連携
+  # ----------------------------------------------------------
+
+  # WAF のログを保存する CloudWatch Logs グループ
+  # ※ 名前は必ず "aws-waf-logs-" で始める必要がある（AWS の仕様）
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "aws-waf-logs-${AWS::StackName}"
+      RetentionInDays: 90    # ログを 90日間 保持（コスト削減のため期限を設定）
+
+  # CloudWatch Logs への書き込み権限を WAF に付与するリソースポリシー
+  WafLogGroupPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-waf-log-policy"
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "delivery.logs.amazonaws.com"
+              },
+              "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Resource": "${WafLogGroup.Arn}",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": "${AWS::AccountId}"
+                },
+                "ArnLike": {
+                  "aws:SourceArn": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+                }
+              }
+            }
+          ]
+        }
+
+  # WAF のログ設定（WAF → CloudWatch Logs への転送を有効化）
+  WafLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    DependsOn: WafLogGroupPolicy
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs:
+        - !GetAtt WafLogGroup.Arn
+      # ログフィルター設定（BLOCKされたリクエストのみ保存してコスト削減）
+      LoggingFilter:
+        DefaultBehavior: DROP   # フィルターに合致しないログは捨てる
+        Filters:
+          - Behavior: KEEP      # 以下の条件に合致するログは保存
+            Conditions:
+              - ActionCondition:
+                  Action: BLOCK # ブロックされたリクエストのみ記録
+            Requirement: MEETS_ANY
+
+  # ----------------------------------------------------------
+  # WAF アラーム（CloudWatch）
+  # ----------------------------------------------------------
+
+  # ⑨ WAF ブロック数アラーム
+  # 5分間に 100 件以上ブロックされたら通知（攻撃の疑い）
+  WafBlockedRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-waf-blocked-requests"
+      AlarmDescription: "WAF が5分間に 100 件以上のリクエストをブロックしました（攻撃の可能性）"
+      Namespace: AWS/WAFV2
+      MetricName: BlockedRequests
+      Dimensions:
+        - Name: WebACL
+          Value: !Ref WebAcl
+        - Name: Region
+          Value: !Ref AWS::Region
+        - Name: Rule
+          Value: ALL
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmSnsTopic
+
+# ============================================================
+# 出力（デプロイ後に確認できる情報）
+# ============================================================
+Outputs:
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  AlbDnsName:
+    Description: ALB の DNS 名（ブラウザでアクセスできる URL）
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+
+  Ec2PublicIp:
+    Description: EC2 のパブリック IP（SSH 接続先）
+    Value: !GetAtt Ec2Instance.PublicIp
+
+  RdsEndpoint:
+    Description: RDS エンドポイント（EC2 から接続する際のホスト名）
+    Value: !GetAtt RdsInstance.Endpoint.Address
+
+  SshCommand:
+    Description: SSH 接続コマンド例
+    Value: !Sub "ssh -i ~/.ssh/${KeyPairName}.pem ec2-user@${Ec2Instance.PublicIp}"
+
+  WafWebAclArn:
+    Description: WAF Web ACL の ARN
+    Value: !GetAtt WebAcl.Arn
+
+  WafLogGroupName:
+    Description: WAF ログの CloudWatch Logs グループ名
+    Value: !Ref WafLogGroup
+
+  AlarmSnsTopicArn:
+    Description: CloudWatch アラーム通知用 SNS トピック ARN
+    Value: !Ref AlarmSnsTopic
