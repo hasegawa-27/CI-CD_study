@@ -1,32 +1,27 @@
-# CI-CD_study
+## GitHub Actions のバージョン管理ポリシー
 
-## インフラ構成概要
-TerraformによるAWSインフラのCI/CD自動化
+本リポジトリでは、サプライチェーン攻撃対策として、ワークフローで使用する
+すべてのサードパーティアクションを **コミット SHA で固定** している。
 
-## 必須対応3点の確認
+- タグ参照(例: `@v4`)は開発元によって参照先を付け替え可能であり、
+  ワークフロー側を変更していなくても実行されるコードが変化するリスクがある
+- コミット SHA はコミット内容から算出される不変の ID であり、
+  実行コードを内容レベルで固定できる
+- 可読性のため、SHA の末尾に対応するリリースバージョンをコメントで併記する
 
-### 1 Environment Protection
-GitHub Settings → Environments → productionにて
-Required reviewersを設定済み(承認必須)
-ワークフローの`environment: production`と一致
+```yaml
+# 記載例
+- uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+```
 
-### 2 S3・DynamoDB・IAMロールの確認
-- S3バケット: ci-cd-study.tfstate-bucket-AWSアカウントID-ap-northeast-1-an(作成済み)
-  - パブリックアクセスブロック: 全て有効 / 暗号化: 有効 / バージョニング: 有効
-  - バケットポリシー: HTTPS以外を拒否、アカウント外からのアクセスを拒否
-- DynamoDBテーブル: ci_cd_study.tfstate(作成済み)
-  - 公開エンドポイントなし。アクセスはIAMのみで制御
-- IAMロール: CI-CD-study-role
-  - 信頼ポリシー: GitHub OIDCを許可(対象リポジトリの main / feature/* / PR のみ)
-  - 許可ポリシー: 最小権限に限定(iam:* は不使用)
-    - S3(ステート): ListBucket / GetObject / PutObject / DeleteObject(対象バケットのみ)
-    - DynamoDB(ロック): GetItem / PutItem / DeleteItem(対象テーブルのみ)
-    - インフラ作成: ec2 / rds / elasticloadbalancing / cloudwatch / logs / wafv2 / sns
-    - IAM: EC2用ロール・インスタンスプロファイルの作成/付与のみ(PassRoleはEC2宛のみ)
-  - ポリシー全文: github-oidc-role-policy.json
+### 更新方針
 
-### 3 ALB・SG・TGの確認
-- ALB: internal = false(internet-facing)
-- ALB SG: HTTP(80)・HTTPS(443)のみ許可(SSH22番なし)
-- EC2 SG: SSH(22)はvar.my_ip/32で自分のIPのみに限定
-- TGポート: 80番で統一(テストと実運用で一致)
+- Dependabot(`.github/dependabot.yml`)により、GitHub Actions および
+  Terraform プロバイダーの新バージョンを毎週自動チェックし、PR で更新する
+- パッチ / マイナー更新は CI の成功を確認のうえマージする
+- メジャー更新はリリースノートで破壊的変更(Breaking Changes)を確認し、
+  CI での動作確認を経てマージする
+- ランナーの実行環境の非推奨化(例: Node.js 20 → 24 移行)にも、
+  アクションのメジャーバージョン更新で追随する
+
+
