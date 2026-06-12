@@ -4,37 +4,43 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: 'applyかdestroyを選択'
+        description: 'applyを選択'
         required: true
         default: 'apply'
         type: choice
         options:
           - apply
-          - destroy
 
 jobs:
-  terraform:
+  plan:
+    name: Terraform Plan
     runs-on: ubuntu-latest
-
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: チェックアウト
-        uses: actions/checkout@v3
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+
 
       - name: Terraformセットアップ
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.14.8" 
 
       - name: AWS認証
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ap-northeast-1
 
       - name: Terraform Init
         run: terraform init
+        working-directory: environments/prod
 
       - name: Terraform Plan
-        run: terraform plan
+        run: terraform plan -out=tfplan -input=false
+        working-directory: environments/prod
         env:
           TF_VAR_key_name: ${{ secrets.TF_VAR_KEY_NAME }}
           TF_VAR_my_ip: ${{ secrets.TF_VAR_MY_IP }}
@@ -43,19 +49,49 @@ jobs:
           TF_VAR_alert_email: ${{ secrets.TF_VAR_ALERT_EMAIL }}
           TF_VAR_env: ${{ secrets.TF_VAR_ENV }}
 
+      - name: planの結果を保存
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: tfplan
+          path: environments/prod/tfplan
+
+  apply:
+    name: Terraform Apply
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: チェックアウト
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+
+      - name: Terraformセットアップ
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        
+        with:
+          terraform_version: "1.14.8" 
+
+      - name: AWS認証
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-northeast-1
+
+      - name: Terraform Init
+        run: terraform init -input=false
+        working-directory: environments/prod
+
+      - name: planの結果をダウンロード
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tfplan
+          path: environments/prod
+
       - name: Terraform Apply
-        if: github.event.inputs.action == 'apply'
-        run: terraform apply -auto-approve
-        env:
-          TF_VAR_key_name: ${{ secrets.TF_VAR_KEY_NAME }}
-          TF_VAR_my_ip: ${{ secrets.TF_VAR_MY_IP }}
-          TF_VAR_db_username: ${{ secrets.TF_VAR_DB_USERNAME }}
-          TF_VAR_db_password: ${{ secrets.TF_VAR_DB_PASSWORD }}
-          TF_VAR_alert_email: ${{ secrets.TF_VAR_ALERT_EMAIL }}
-          TF_VAR_env: ${{ secrets.TF_VAR_ENV }}
-      - name: Terraform Destroy
-        if: github.event.inputs.action == 'destroy'
-        run: terraform destroy -auto-approve  
+        run: terraform apply -input=false tfplan
+        working-directory: environments/prod
         env:
           TF_VAR_key_name: ${{ secrets.TF_VAR_KEY_NAME }}
           TF_VAR_my_ip: ${{ secrets.TF_VAR_MY_IP }}
