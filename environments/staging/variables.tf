@@ -27,6 +27,7 @@ variable "alert_email" {
 variable "subnet_cidr_1c" {
   description = "Public subnet CIDR for AZ 1c"
   type        = string
+  default     = "10.0.4.0/24"
 }
 
 variable "env" {
